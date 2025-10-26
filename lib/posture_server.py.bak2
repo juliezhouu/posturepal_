@@ -1,0 +1,603 @@
+# posture_server.py
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import time
+import base64
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+from pydantic import BaseModel
+
+# ============== Constants ==============
+EPS = 1e-6
+EMA_ALPHA = 0.5       # reacts faster (was 0.3)
+GOOD_CUT = 0.6        # threshold between GOOD and MODERATE (was 0.8)
+POOR_CUT = 1.2        # threshold for POOR (was 1.6)
+SIDE_TILT_CUT = 1.2   # side-tilt gate (was 1.5)
+SENS_GAIN = 1.3       # multiplies all slouch z-scores
+CALIB_SECONDS = 10.0  # calibration period in seconds
+
+# ============== FastAPI app ==============
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
+
+class ImagePayload(BaseModel):
+    image: str
+    calibration_mode: bool = False  # True during initial calibration period
+
+
+# Global state for browser-based calibration
+browser_calib = {
+    "delta": [], "head_fwd": [], "torso_deg": [], "neck_deg": [],
+    "shoulder_ratio": [], "ear_over_hip": [], "interseg_deg": [],
+    "shoulder_line_deg": [], "hip_line_deg": [], "lat_shift": [],
+    "chin_chest": [],
+}
+browser_calib_start = None
+browser_calib_done = False
+browser_base = {}  # Will hold mu/sd after calibration like 'base'
+
+# ============== Helper functions ==============
+def safe_std(x):
+    if len(x) < 2: return 1.0
+    s = float(np.std(x)); return s if s > 1e-6 else 1.0
+
+def to_xy(lm, w, h): return np.array([lm.x * w, lm.y * h], dtype=np.float32)
+def mid(p1, p2): return (p1 + p2) * 0.5
+def dist(a, b): return float(np.linalg.norm(a - b))
+def deg_from_vertical(base, top):
+    v = top - base; dx = float(v[0]); dy = float(v[1])
+    return math.degrees(math.atan2(abs(dx), abs(dy) + EPS))
+def line_deg(p_left, p_right):
+    return math.degrees(math.atan2(float(p_right[1] - p_left[1]),
+                                   float(p_right[0] - p_left[0])))
+def lateral_shift(sho_mid, hip_mid, torso_len):
+    return abs(float(sho_mid[0] - hip_mid[0])) / max(torso_len, EPS)
+def point_line_distance(p, a, b):
+    """Perpendicular distance from point p to infinite line a--b (pixels)."""
+    ap = p - a; ab = b - a
+    denom = np.linalg.norm(ab) + EPS
+    proj = ab * (np.dot(ap, ab) / (denom**2))
+    ortho = ap - proj
+    return float(np.linalg.norm(ortho))
+def avg_visibility(lms, ids):
+    vals = [lms[i].visibility for i in ids]
+    return float(np.mean(vals)) if vals else 0.0
+
+
+@app.post("/analyze")
+def analyze_image(payload: ImagePayload):
+    """Accept a base64-encoded image (data URL or raw base64) and return posture analysis.
+    Handles both calibration mode and regular analysis.
+    """
+    global browser_calib, browser_calib_start, browser_calib_done, browser_base
+    
+    try:
+        # Initialize calibration if needed
+        if payload.calibration_mode and not browser_calib_start:
+            browser_calib_start = time.time()
+            browser_calib_done = False
+            browser_base = {}
+            for k in browser_calib:
+                browser_calib[k] = []
+                
+        # Decode image
+        b64 = payload.image.split(",", 1)[1] if "," in payload.image else payload.image
+        jpg = base64.b64decode(b64)
+        arr = np.frombuffer(jpg, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return JSONResponse({"state": "NO_POSE", "calibrating": not browser_calib_done, "tip": "Invalid image"}, status_code=400)
+
+        # Process with MediaPipe Pose
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False,
+                          min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+            results = pose.process(rgb)
+
+        tick_time = time.time()
+
+        # No pose detected
+        if not results.pose_landmarks:
+            seconds_left = CALIB_SECONDS - (tick_time - browser_calib_start) if browser_calib_start else None
+            resp = {
+                "neck_deg": None, "torso_deg": None, "delta_deg": None,
+                "state": "NO_POSE",
+                "visibility_ok": False,
+                "tip": "Move into view and face the camera.",
+                "issues": [],
+                "calibrating": not browser_calib_done,
+                "seconds_left": round(seconds_left, 1) if seconds_left is not None else None,
+                "samples_collected": len(browser_calib["delta"]) if not browser_calib_done else None,
+            }
+            return JSONResponse(resp)
+
+        # Extract landmarks and compute metrics
+        lms = results.pose_landmarks.landmark
+        h, w = frame.shape[:2]
+        L_SH = to_xy(lms[mp_pose.PoseLandmark.LEFT_SHOULDER.value], w, h)
+        R_SH = to_xy(lms[mp_pose.PoseLandmark.RIGHT_SHOULDER.value], w, h)
+        L_HP = to_xy(lms[mp_pose.PoseLandmark.LEFT_HIP.value], w, h)
+        R_HP = to_xy(lms[mp_pose.PoseLandmark.RIGHT_HIP.value], w, h)
+        L_ER = to_xy(lms[mp_pose.PoseLandmark.LEFT_EAR.value], w, h)
+        R_ER = to_xy(lms[mp_pose.PoseLandmark.RIGHT_EAR.value], w, h)
+        NOSE = to_xy(lms[mp_pose.PoseLandmark.NOSE.value], w, h)
+
+        SHO = mid(L_SH, R_SH); HIP = mid(L_HP, R_HP); EAR = mid(L_ER, R_ER)
+        torso_len = dist(HIP, SHO) + EPS
+
+        vis_ok = avg_visibility(lms, [
+            mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+            mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+            mp_pose.PoseLandmark.LEFT_HIP.value,
+            mp_pose.PoseLandmark.RIGHT_HIP.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value,
+            mp_pose.PoseLandmark.RIGHT_EAR.value,
+        ]) >= 0.6
+
+        # Compute core metrics
+        neck_deg = round(deg_from_vertical(SHO, EAR), 2)
+        torso_deg = round(deg_from_vertical(HIP, SHO), 2)
+        delta_deg = round(abs(neck_deg - torso_deg), 2)
+        head_fwd = round(abs(float(EAR[0] - SHO[0])) / max(torso_len, EPS), 3)
+        shoulder_width = dist(L_SH, R_SH)
+        shoulder_ratio = round(shoulder_width / max(torso_len, EPS), 3)
+        shoulder_line_deg = round(line_deg(L_SH, R_SH), 2)
+        hip_line_deg = round(line_deg(L_HP, R_HP), 2)
+        lat_shift = round(lateral_shift(SHO, HIP, torso_len), 3)
+        chin_chest = round(point_line_distance(NOSE, L_SH, R_SH) / max(torso_len, EPS), 3)
+        if calib_done:
+            mu = {k: base[k]["mu"] for k in base}
+            sd = {k: base[k]["sd"] for k in base}
+
+            s_delta = z_neg(delta_deg, mu["delta"], sd["delta"])
+            s_head  = z_pos(head_fwd, mu["head_fwd"], sd["head_fwd"])
+            s_neck  = z_pos(neck_deg, mu["neck_deg"], sd["neck_deg"])
+            s_torso = z_pos(torso_deg, mu["torso_deg"], sd["torso_deg"])
+            s_shrat = z_neg(shoulder_ratio, mu["shoulder_ratio"], sd["shoulder_ratio"])
+            s_inter = z_neg(interseg_deg, mu["interseg_deg"], sd["interseg_deg"]) * 0.2
+            s_chin  = z_neg(chin_chest, mu["chin_chest"], sd["chin_chest"])  # smaller = worse
+
+            s_delta *= SENS_GAIN; s_head *= SENS_GAIN; s_neck *= SENS_GAIN
+            s_torso *= SENS_GAIN; s_shrat *= SENS_GAIN; s_inter *= SENS_GAIN; s_chin *= SENS_GAIN
+
+            slouch_score = 0.35*s_delta + 0.25*s_head + 0.15*s_neck + 0.15*s_torso + 0.10*s_shrat + s_inter + 0.20*s_chin
+
+            z_sh_line = abs(shoulder_line_deg - mu["shoulder_line_deg"]) / max(sd["shoulder_line_deg"], 1.0)
+            z_hip_line = abs(hip_line_deg - mu["hip_line_deg"]) / max(sd["hip_line_deg"], 1.0)
+            z_lat = z_pos(lat_shift, mu["lat_shift"], sd["lat_shift"])
+            side_tilt_score = 0.6*z_sh_line + 0.4*z_hip_line + 0.5*z_lat
+
+            # Hard triggers
+            hard_poor = False
+            if chin_chest <= (mu["chin_chest"] - 0.8 * sd["chin_chest"]): hard_poor = True
+            if (delta_deg <= (mu["delta"] - 1.0 * sd["delta"])) and (head_fwd >= (mu["head_fwd"] + 0.8 * sd["head_fwd"])):
+                hard_poor = True
+            if (delta_deg < 4.0) and (neck_deg > 12.0): hard_poor = True
+
+            if side_tilt_score is not None and side_tilt_score > SIDE_TILT_CUT and slouch_score < GOOD_CUT:
+                new_state = "SIDE_TILT"
+            elif hard_poor or slouch_score >= POOR_CUT:
+                new_state = "POOR"
+            elif slouch_score >= GOOD_CUT:
+                new_state = "MODERATE"
+            else:
+                new_state = "GOOD"
+
+            out["slouch_score_ema"] = round(slouch_score, 3)
+            out["side_tilt_score_ema"] = round(side_tilt_score, 3)
+            out["state"] = new_state
+        else:
+            out["state"] = "CALIBRATING"
+
+        tip_text, issues = make_tip(out, base if calib_done else {}, {k: base[k]["sd"] for k in base} if calib_done else {})
+        out["tip"] = tip_text
+        out["issues"] = issues
+
+        return JSONResponse(out)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ============== Sensitivity knobs ==============
+EMA_ALPHA = 0.5       # reacts faster (was 0.3)
+GOOD_CUT = 0.6        # threshold between GOOD and MODERATE (was 0.8)
+POOR_CUT = 1.2        # threshold for POOR (was 1.6)
+SIDE_TILT_CUT = 1.2   # side-tilt gate (was 1.5)
+SENS_GAIN = 1.3       # multiplies all slouch z-scores
+
+# ============== Constants ==============
+EPS = 1e-6
+EMA_ALPHA = 0.5       # reacts faster (was 0.3)
+GOOD_CUT = 0.6        # threshold between GOOD and MODERATE (was 0.8)
+POOR_CUT = 1.2        # threshold for POOR (was 1.6)
+SIDE_TILT_CUT = 1.2   # side-tilt gate (was 1.5)
+SENS_GAIN = 1.3       # multiplies all slouch z-scores
+
+# ============== Pose setup ==============
+mp_pose = mp.solutions.pose
+
+EPS = 1e-6
+
+# ============== math helpers ==============
+def to_xy(lm, w, h): return np.array([lm.x * w, lm.y * h], dtype=np.float32)
+def mid(p1, p2): return (p1 + p2) * 0.5
+def dist(a, b): return float(np.linalg.norm(a - b))
+def deg_from_vertical(base, top):
+    v = top - base; dx = float(v[0]); dy = float(v[1])
+    return math.degrees(math.atan2(abs(dx), abs(dy) + EPS))
+def line_deg(p_left, p_right):
+    return math.degrees(math.atan2(float(p_right[1] - p_left[1]),
+                                   float(p_right[0] - p_left[0])))
+def lateral_shift(sho_mid, hip_mid, torso_len):
+    return abs(float(sho_mid[0] - hip_mid[0])) / max(torso_len, EPS)
+def safe_std(x):
+    if len(x) < 2: return 1.0
+    s = float(np.std(x)); return s if s > 1e-6 else 1.0
+def ema(prev, x, alpha=EMA_ALPHA): return x if prev is None else alpha * x + (1 - alpha) * prev
+def z_pos(x, mu, sigma): return max(0.0, (x - mu) / max(sigma, 1.0))
+def z_neg(x, mu, sigma): return max(0.0, (mu - x) / max(sigma, 1.0))
+def avg_visibility(lms, ids):
+    vals = [lms[i].visibility for i in ids]
+    return float(np.mean(vals)) if vals else 0.0
+def point_line_distance(p, a, b):
+    """Perpendicular distance from point p to infinite line a--b (pixels)."""
+    ap = p - a; ab = b - a
+    denom = np.linalg.norm(ab) + EPS
+    proj = ab * (np.dot(ap, ab) / (denom**2))
+    ortho = ap - proj
+    return float(np.linalg.norm(ortho))
+
+# ============== calibration/state ==============
+calib_seconds = 10.0
+calib_start_time = time.time()
+calib_done = False
+
+calib = {
+    "delta": [], "head_fwd": [], "torso_deg": [], "neck_deg": [],
+    "shoulder_ratio": [], "ear_over_hip": [], "interseg_deg": [],
+    "shoulder_line_deg": [], "hip_line_deg": [], "lat_shift": [],
+    "chin_chest": [],   # NEW: nose-to-shoulder-line / torso_len
+}
+base = {}
+slouch_score_ema = None
+side_tilt_score_ema = None
+current_state = "CALIBRATING"
+state_change_time = time.time()
+last_send = 0.0
+last_log = 0.0
+
+# ============== tips ==============
+def direction_from_sign(val: float) -> str:
+    if val > 0.04: return "right"
+    if val < -0.04: return "left"
+    return ""
+
+def make_tip(payload: dict, mu: dict, sd: dict):
+    issues = []
+    state = payload["state"]
+    z = {}
+    def Z(name, x):
+        z[name] = {"pos": z_pos(x, mu.get(name, 0.0), sd.get(name, 1.0)),
+                   "neg": z_neg(x, mu.get(name, 0.0), sd.get(name, 1.0))}
+    Z("delta", payload["delta_deg"])
+    Z("head_fwd", payload["head_fwd"])
+    Z("neck_deg", payload["neck_deg"])
+    Z("torso_deg", payload["torso_deg"])
+    Z("shoulder_ratio", payload["shoulder_ratio"])
+    Z("lat_shift", payload["lat_shift"])
+    Z("chin_chest", payload["chin_chest"])  # NEW
+
+    sho_x = payload["_sho_x"]; hip_x = payload["_hip_x"]; torso_len_px = payload["_torso_len_px"] + EPS
+    signed_shift = (sho_x - hip_x) / torso_len_px
+    dir_word = direction_from_sign(signed_shift)
+
+    if state == "SIDE_TILT" or z["lat_shift"]["pos"] >= 1.5:
+        issues.append("Side tilt" + (f" to the {dir_word}" if dir_word else ""))
+
+    if z["delta"]["neg"] >= 1.0: issues.append("Neck and torso aligned (slouch cue)")
+    if z["head_fwd"]["pos"] >= 1.0: issues.append("Head forward of shoulders")
+    if z["neck_deg"]["pos"] >= 1.0: issues.append("Neck flexed forward")
+    if z["torso_deg"]["pos"] >= 1.0: issues.append("Torso leaning forward")
+    if z["shoulder_ratio"]["neg"] >= 1.0: issues.append("Shoulders likely protracted")
+    if z["chin_chest"]["neg"] >= 1.0: issues.append("Chin dropped toward chest")  # NEW
+
+    if state == "POOR":
+        if z["head_fwd"]["pos"] >= 1.2 and z["delta"]["neg"] >= 1.2:
+            tip = "Pull chin back over shoulders and lift sternum; grow tall through the crown."
+        elif z["chin_chest"]["neg"] >= 1.2:
+            tip = "Float the chin away from the chest and lift your sternum. Lengthen the back of your neck."
+        elif z["torso_deg"]["pos"] >= 1.2:
+            tip = "Hinge up from mid-back and stack shoulders over hips."
+        else:
+            tip = "Sit tall: ears over shoulders, shoulders over hips."
+        if dir_word: tip += f" Also, center from the {dir_word}."
+        return tip, issues
+    if state == "SIDE_TILT":
+        tip = f"Center your trunk. Shift off the {dir_word or 'tilted'} side until level."
+        return tip, issues
+    if state == "MODERATE":
+        return "Quick reset: tuck chin slightly, raise chest, relax shoulders down/back.", issues
+    if state == "CALIBRATING":
+        return "Calibrating upright baseline. Sit naturally upright.", issues
+    return "Nice posture. Keep chin level and shoulders relaxed.", issues
+
+# ============== HUD overlay ==============
+def draw_hud(frame, payload):
+    h, w = frame.shape[:2]
+    state = payload["state"]
+    color = (134,134,150)
+    if state == "GOOD": color = (32,201,151)
+    elif state == "MODERATE": color = (0,191,255)
+    elif state == "POOR": color = (49,49,224)
+    elif state == "SIDE_TILT": color = (240,144,51)
+
+    cv2.rectangle(frame, (0,0), (w, 36), color, -1)
+
+    def put(y, text, scale=0.55, col=(255,255,255), thick=1):
+        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, scale, col, thick, cv2.LINE_AA)
+
+    put(24, f"State: {state}   Persist: {payload.get('persist_seconds','—')}s   Calibrating: {payload.get('calibrating')}")
+    neck = payload.get("neck_deg"); torso = payload.get("torso_deg"); delta = payload.get("delta_deg")
+    s_ema = payload.get("slouch_score_ema"); st_ema = payload.get("side_tilt_score_ema")
+    chin = payload.get("chin_chest")
+    put(58, f"Neck {neck}°  Torso {torso}°  Δ {delta}°  ChinChest {chin}  S_EMA {s_ema}  ST_EMA {st_ema}")
+    tip = payload.get("tip","")
+    if tip:
+        tip = (tip[:90] + "…") if len(tip) > 90 else tip
+        put(84, f"Tip: {tip}", scale=0.55, col=(230,230,230))
+
+# ============== main posture loop (MAIN THREAD) ==============
+def posture_loop():
+    global calib_done, base, slouch_score_ema, side_tilt_score_ema
+    global current_state, state_change_time, last_send, last_log, latest_out
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            black = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.imshow(WIN, black)
+            if cv2.waitKey(1) & 0xFF == 27: break
+            continue
+
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+
+        if results.pose_landmarks:
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+        tick_time = time.time()
+
+        # ---------- No pose ----------
+        if not results.pose_landmarks:
+            payload = {
+                "neck_deg": None, "torso_deg": None, "delta_deg": None,
+                "state": "NO_POSE",
+                "persist_seconds": round(tick_time - state_change_time, 2),
+                "visibility_ok": False,
+                "tip": "Move into view and face the camera.",
+                "issues": [],
+                "calibrating": not calib_done,
+                "slouch_score_ema": None,
+                "side_tilt_score_ema": None,
+                "chin_chest": None
+            }
+            draw_hud(frame, payload)
+            cv2.imshow(WIN, frame)
+            if cv2.waitKey(1) & 0xFF == 27: break
+            if tick_time - last_send > 0.2:
+                latest_out = payload; last_send = tick_time
+            if tick_time - last_log > 0.5:
+                print(f"[NO_POSE] cal={payload['calibrating']} persist={payload['persist_seconds']}s")
+                last_log = tick_time
+            continue
+
+        # ---------- Landmarks ----------
+        lms = results.pose_landmarks.landmark
+        L_SH = to_xy(lms[mp_pose.PoseLandmark.LEFT_SHOULDER.value], w, h)
+        R_SH = to_xy(lms[mp_pose.PoseLandmark.RIGHT_SHOULDER.value], w, h)
+        L_HP = to_xy(lms[mp_pose.PoseLandmark.LEFT_HIP.value], w, h)
+        R_HP = to_xy(lms[mp_pose.PoseLandmark.RIGHT_HIP.value], w, h)
+        L_ER = to_xy(lms[mp_pose.PoseLandmark.LEFT_EAR.value], w, h)
+        R_ER = to_xy(lms[mp_pose.PoseLandmark.RIGHT_EAR.value], w, h)
+        NOSE = to_xy(lms[mp_pose.PoseLandmark.NOSE.value], w, h)
+
+        SHO = mid(L_SH, R_SH); HIP = mid(L_HP, R_HP); EAR = mid(L_ER, R_ER)
+        torso_len = dist(HIP, SHO) + EPS
+
+        vis_ok = avg_visibility(lms, [
+            mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+            mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+            mp_pose.PoseLandmark.LEFT_HIP.value,
+            mp_pose.PoseLandmark.RIGHT_HIP.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value,
+            mp_pose.PoseLandmark.RIGHT_EAR.value,
+        ]) >= 0.6
+
+        # ---------- Core features ----------
+        neck_deg = round(deg_from_vertical(SHO, EAR), 2)
+        torso_deg = round(deg_from_vertical(HIP, SHO), 2)
+        delta_deg = round(abs(neck_deg - torso_deg), 2)
+        head_fwd = round(abs(float(EAR[0] - SHO[0])) / max(torso_len, EPS), 3)
+        ear_over_hip = round(abs(float(EAR[0] - HIP[0])) / max(torso_len, EPS), 3)
+        shoulder_width = dist(L_SH, R_SH)
+        shoulder_ratio = round(shoulder_width / max(torso_len, EPS), 3)
+
+        v1 = SHO - HIP; v2 = EAR - SHO
+        c = float(np.dot(v1, v2)) / (np.linalg.norm(v1) * np.linalg.norm(v2) + EPS)
+        c = min(1.0, max(-1.0, c))
+        interseg_deg = round(math.degrees(math.acos(c)), 2)
+
+        shoulder_line_deg = round(line_deg(L_SH, R_SH), 2)
+        hip_line_deg = round(line_deg(L_HP, R_HP), 2)
+        lat_shift = round(lateral_shift(SHO, HIP, torso_len), 3)
+
+        # ---------- Chin-to-chest ----------
+        nose_to_shoulder_px = point_line_distance(NOSE, L_SH, R_SH)
+        chin_chest = round(nose_to_shoulder_px / max(torso_len, EPS), 3)  # smaller ⇒ chin tucked
+
+        # ---------- Calibration collect ----------
+        if not calib_done and vis_ok:
+            calib["delta"].append(delta_deg)
+            calib["head_fwd"].append(head_fwd)
+            calib["torso_deg"].append(torso_deg)
+            calib["neck_deg"].append(neck_deg)
+            calib["shoulder_ratio"].append(shoulder_ratio)
+            calib["ear_over_hip"].append(ear_over_hip)
+            calib["interseg_deg"].append(interseg_deg)
+            calib["shoulder_line_deg"].append(shoulder_line_deg)
+            calib["hip_line_deg"].append(hip_line_deg)
+            calib["lat_shift"].append(lat_shift)
+            calib["chin_chest"].append(chin_chest)
+
+        # ---------- Finish calibration ----------
+        if not calib_done and (tick_time - calib_start_time) >= calib_seconds:
+            base.update({k: {"mu": float(np.mean(v)) if len(v) > 0 else 0.0,
+                             "sd": safe_std(v) if len(v) > 1 else 1.0}
+                         for k, v in calib.items()})
+            calib_done = True
+            current_state = "GOOD"
+            state_change_time = tick_time
+
+        # ---------- During calibration ----------
+        if not calib_done:
+            payload = {
+                "neck_deg": neck_deg, "torso_deg": torso_deg, "delta_deg": delta_deg,
+                "chin_chest": chin_chest,
+                "state": "CALIBRATING",
+                "seconds_left": round(max(0.0, calib_seconds - (tick_time - calib_start_time)), 1),
+                "visibility_ok": bool(vis_ok),
+                "tip": "Calibrating upright baseline. Sit naturally upright.",
+                "issues": [],
+                "calibrating": True,
+                "slouch_score_ema": None,
+                "side_tilt_score_ema": None
+            }
+            draw_hud(frame, payload)
+            cv2.imshow(WIN, frame)
+            if cv2.waitKey(1) & 0xFF == 27: break
+            if tick_time - last_send > 0.2:
+                latest_out = payload; last_send = tick_time
+            if tick_time - last_log > 0.5:
+                print(f"[CAL] left={payload['seconds_left']}s neck={neck_deg} tor={torso_deg} Δ={delta_deg} chin={chin_chest}")
+                last_log = tick_time
+            continue
+
+        # ---------- After calibration: scores ----------
+        mu = {k: base[k]["mu"] for k in base}
+        sd = {k: base[k]["sd"] for k in base}
+
+        s_delta = z_neg(delta_deg, mu["delta"], sd["delta"])
+        s_head  = z_pos(head_fwd, mu["head_fwd"], sd["head_fwd"])
+        s_neck  = z_pos(neck_deg, mu["neck_deg"], sd["neck_deg"])
+        s_torso = z_pos(torso_deg, mu["torso_deg"], sd["torso_deg"])
+        s_shrat = z_neg(shoulder_ratio, mu["shoulder_ratio"], sd["shoulder_ratio"])
+        s_inter = z_neg(interseg_deg, mu["interseg_deg"], sd["interseg_deg"]) * 0.2
+        s_chin  = z_neg(chin_chest, mu["chin_chest"], sd["chin_chest"])  # smaller = worse
+
+        # Boost sensitivity
+        s_delta *= SENS_GAIN; s_head *= SENS_GAIN; s_neck *= SENS_GAIN
+        s_torso *= SENS_GAIN; s_shrat *= SENS_GAIN; s_inter *= SENS_GAIN; s_chin *= SENS_GAIN
+
+        slouch_score = 0.35*s_delta + 0.25*s_head + 0.15*s_neck + 0.15*s_torso + 0.10*s_shrat + s_inter + 0.20*s_chin
+        slouch_score_ema = ema(slouch_score_ema, slouch_score, EMA_ALPHA)
+
+        z_sh_line = abs(shoulder_line_deg - mu["shoulder_line_deg"]) / max(sd["shoulder_line_deg"], 1.0)
+        z_hip_line = abs(hip_line_deg - mu["hip_line_deg"]) / max(sd["hip_line_deg"], 1.0)
+        z_lat = z_pos(lat_shift, mu["lat_shift"], sd["lat_shift"])
+        side_tilt_score = 0.6*z_sh_line + 0.4*z_hip_line + 0.5*z_lat
+        side_tilt_score_ema = ema(side_tilt_score_ema, side_tilt_score, EMA_ALPHA)
+
+        # Side-tilt flag
+        side_flag = side_tilt_score_ema is not None and side_tilt_score_ema > SIDE_TILT_CUT
+
+        # --- Hard triggers (immediate POOR if strong cues) ---
+        hard_poor = False
+        # Chin very close to chest vs baseline
+        if chin_chest <= (mu["chin_chest"] - 0.8 * sd["chin_chest"]):
+            hard_poor = True
+        # Classic slouch: small Δ + head-forward vs baseline
+        if (delta_deg <= (mu["delta"] - 1.0 * sd["delta"])) and (head_fwd >= (mu["head_fwd"] + 0.8 * sd["head_fwd"])):
+            hard_poor = True
+        # Absolute safety net (even if calibration noisy)
+        if (delta_deg < 4.0) and (neck_deg > 12.0):
+            hard_poor = True
+
+        # State machine with tuned cuts
+        if slouch_score_ema is None:
+            new_state = "GOOD"
+        else:
+            if side_flag and slouch_score_ema < GOOD_CUT:
+                new_state = "SIDE_TILT"
+            elif hard_poor or slouch_score_ema >= POOR_CUT:
+                new_state = "POOR"
+            elif slouch_score_ema >= GOOD_CUT:
+                new_state = "MODERATE"
+            else:
+                new_state = "GOOD"
+
+        if new_state != current_state:
+            current_state = new_state
+            state_change_time = tick_time
+
+        persist_seconds = round(tick_time - state_change_time, 2)
+
+        out = {
+            "neck_deg": neck_deg,
+            "torso_deg": torso_deg,
+            "delta_deg": delta_deg,
+            "chin_chest": chin_chest,
+            "head_fwd": head_fwd,
+            "ear_over_hip": ear_over_hip,
+            "shoulder_ratio": shoulder_ratio,
+            "interseg_deg": interseg_deg,
+            "shoulder_line_deg": shoulder_line_deg,
+            "hip_line_deg": hip_line_deg,
+            "lat_shift": lat_shift,
+            "slouch_score_ema": None if slouch_score_ema is None else round(slouch_score_ema, 3),
+            "side_tilt_score_ema": None if side_tilt_score_ema is None else round(side_tilt_score_ema, 3),
+            "state": current_state,
+            "persist_seconds": persist_seconds,
+            "visibility_ok": bool(vis_ok),
+            "params": {
+                "version": "v0.5-sens",
+                "good_cut": GOOD_CUT, "poor_cut": POOR_CUT, "side_tilt_cut": SIDE_TILT_CUT,
+                "ema_alpha": EMA_ALPHA, "calib_seconds": calib_seconds, "sens_gain": SENS_GAIN
+            },
+            "_sho_x": float(SHO[0]),
+            "_hip_x": float(HIP[0]),
+            "_torso_len_px": float(dist(HIP, SHO)),
+            "calibrating": False
+        }
+
+        tip_text, issues = make_tip(out, mu, sd)
+        out["tip"] = tip_text
+        out["issues"] = issues
+
+        # Draw + show
+        draw_hud(frame, out)
+        cv2.imshow(WIN, frame)
+        if cv2.waitKey(1) & 0xFF == 27: break
+
+        # Serve + console log
+        now = time.time()
+        if now - last_send > 0.2:
+            latest_out = out; last_send = now
+        if now - last_log > 0.5:
+            print(f"[{out['state']}] t={persist_seconds}s Δ={delta_deg} neck={neck_deg} tor={torso_deg} chin={chin_chest} "
+                  f"S_EMA={out['slouch_score_ema']} ST_EMA={out['side_tilt_score_ema']} | Tip: {out['tip']}")
+            last_log = now
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ============== entrypoint ==============
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)

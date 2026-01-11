@@ -143,9 +143,8 @@ export default function StatusDisplay({ posture, message, calibrating, secondsLe
     return (
       <div
         style={{
-          padding: "20px",
-          borderRadius: "12px",
-          marginTop: "20px",
+          padding: "2rem",
+          borderRadius: "16px",
           textAlign: "center",
         }}
       >
@@ -154,65 +153,168 @@ export default function StatusDisplay({ posture, message, calibrating, secondsLe
     );
   }
 
+  const getPostureColor = () => {
+    if (calibrating) return "var(--primary)";
+    switch (posture) {
+      case "good": return "var(--secondary)";
+      case "bad": return "var(--danger)";
+      default: return "var(--text-secondary)";
+    }
+  };
+
+  const getPostureIcon = () => {
+    if (calibrating) return "⏱️";
+    switch (posture) {
+      case "good": return "✅";
+      case "bad": return "⚠️";
+      default: return "❓";
+    }
+  };
+
   return (
     <div
       style={{
-        padding: "20px",
+        padding: "1.5rem",
         borderRadius: "12px",
-        marginTop: "20px",
-        textAlign: "center",
+        backgroundColor: "var(--bg-secondary)",
+        border: "2px solid var(--border)",
       }}
     >
       {calibrating ? (
-        <div>
-          <p style={{ fontSize: "1.2rem", marginBottom: "10px" }}>Calibrating your posture...</p>
+        <div style={{ textAlign: "center" }}>
+          <div style={{
+            fontSize: "2.5rem",
+            marginBottom: "0.75rem",
+          }}>
+            {getPostureIcon()}
+          </div>
+          <h3 style={{
+            fontSize: "1.25rem",
+            marginBottom: "0.5rem",
+            color: getPostureColor(),
+            fontWeight: "600",
+          }}>
+            Calibrating Your Posture
+          </h3>
           {secondsLeft !== undefined && (
-            <p style={{ fontSize: "1rem", color: "#666" }}>Time remaining: {secondsLeft}s</p>
+            <p style={{
+              fontSize: "1rem",
+              color: "var(--text-secondary)",
+              marginBottom: "1rem",
+            }}>
+              Time remaining: <strong style={{ color: "var(--primary)" }}>{secondsLeft}s</strong>
+            </p>
           )}
           {samplesCollected !== undefined && (
-            <div style={{ marginTop: "10px" }}>
-              <p style={{ fontSize: "0.9rem", color: "#666" }}>Samples collected: {samplesCollected}</p>
-              <div style={{ 
-                width: "100%", 
-                height: "8px", 
-                backgroundColor: "#eee", 
-                borderRadius: "4px",
-                marginTop: "5px" 
+            <div style={{ marginTop: "0.75rem" }}>
+              <div style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "0.5rem",
+              }}>
+                <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Progress</span>
+                <span style={{ fontSize: "0.85rem", fontWeight: "600", color: "var(--primary)" }}>
+                  {samplesCollected}/10
+                </span>
+              </div>
+              <div style={{
+                width: "100%",
+                height: "10px",
+                backgroundColor: "#e2e8f0",
+                borderRadius: "5px",
+                overflow: "hidden",
               }}>
                 <div style={{
                   width: `${Math.min((samplesCollected / 10) * 100, 100)}%`,
                   height: "100%",
-                  backgroundColor: "#4CAF50",
-                  borderRadius: "4px",
-                  transition: "width 0.3s ease-in-out"
+                  background: "linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%)",
+                  borderRadius: "5px",
+                  transition: "width 0.4s ease-out",
                 }} />
               </div>
             </div>
           )}
-          <p style={{ fontSize: "0.9rem", marginTop: "15px", color: "#666" }}>
-            Please maintain a comfortable, upright posture while looking at your screen
-          </p>
+          <div style={{
+            marginTop: "1rem",
+            padding: "0.75rem",
+            backgroundColor: "rgba(37, 99, 235, 0.1)",
+            borderRadius: "10px",
+            border: "1px solid rgba(37, 99, 235, 0.2)",
+          }}>
+            <p style={{
+              fontSize: "0.875rem",
+              color: "var(--text-primary)",
+              margin: 0,
+              lineHeight: "1.5",
+            }}>
+              💡 Maintain a comfortable, upright posture while looking at your screen
+            </p>
+          </div>
         </div>
       ) : (
-        <p style={{ fontSize: "1.2rem" }}>{message}</p>
+        <div style={{ textAlign: "center" }}>
+          <div style={{
+            fontSize: "3rem",
+            marginBottom: "0.75rem",
+          }}>
+            {getPostureIcon()}
+          </div>
+          <div style={{
+            fontSize: "1.1rem",
+            color: "var(--text-primary)",
+            fontWeight: "500",
+            lineHeight: "1.6",
+          }}>
+            {message}
+          </div>
+          {posture !== "unknown" && (
+            <div style={{
+              marginTop: "1rem",
+              padding: "0.75rem 1.25rem",
+              backgroundColor: posture === "good" ? "rgba(16, 185, 129, 0.1)" : "rgba(239, 68, 68, 0.1)",
+              borderRadius: "10px",
+              border: `2px solid ${posture === "good" ? "var(--secondary)" : "var(--danger)"}`,
+            }}>
+              <span style={{
+                fontSize: "1rem",
+                fontWeight: "600",
+                color: getPostureColor(),
+              }}>
+                {posture === "good" ? "Great Job!" : "Needs Attention"}
+              </span>
+            </div>
+          )}
+        </div>
       )}
       {'Notification' in window && notifPermission !== 'granted' && (
-        <div style={{ marginTop: 12 }}>
-          <button 
-            onClick={requestPermission} 
-            style={{ 
-              padding: '8px 12px', 
-              borderRadius: 6,
-              backgroundColor: '#4CAF50',
-              color: 'white',
-              border: 'none',
-              cursor: 'pointer'
+        <div style={{
+          marginTop: "1.5rem",
+          paddingTop: "1.5rem",
+          borderTop: "1px solid var(--border)",
+        }}>
+          <button
+            onClick={requestPermission}
+            style={{
+              padding: "0.625rem 1.5rem",
+              borderRadius: "10px",
+              backgroundColor: "var(--primary)",
+              color: "white",
+              border: "none",
+              cursor: "pointer",
+              fontSize: "0.9rem",
+              fontWeight: "600",
+              boxShadow: "var(--shadow)",
             }}
           >
-            Enable notifications
+            🔔 Enable Notifications
           </button>
-          <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
-            Current permission: {notifPermission ?? 'unknown'}
+          <div style={{
+            marginTop: "0.625rem",
+            fontSize: "0.8rem",
+            color: "var(--text-secondary)",
+          }}>
+            Get alerts when your posture needs correction
           </div>
         </div>
       )}

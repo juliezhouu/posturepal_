@@ -54,39 +54,80 @@ export default function WebcamFeed({ onCapture }: Props) {
   }, [isInitializing, onCapture]);
 
   return (
-    <div>
-      <Webcam
-        ref={webcamRef}
-        screenshotFormat="image/jpeg"
-        width={600}
-        height={450}
-        videoConstraints={{
-          facingMode: "user",
-          width: 1280,
-          height: 720
-        }}
-        style={{
-          borderRadius: "12px",
-          boxShadow: "0 4px 12px rgba(0, 0, 0, 0.15)"
-        }}
-      />
-      {isInitializing && (
-        <div style={{
-          marginTop: "10px",
-          textAlign: "center",
-          padding: "10px",
-          backgroundColor: "#f0f8ff",
-          borderRadius: "8px",
-          border: "1px solid #4CAF50"
-        }}>
-          <p style={{ margin: "0", fontSize: "1.1rem", color: "#2E7D32" }}>
-            Please sit upright and center yourself in the camera
-          </p>
-          <p style={{ margin: "4px 0 0 0", fontSize: "1.2rem", fontWeight: "bold", color: "#1B5E20" }}>
-            Starting in {countdown} seconds...
-          </p>
-        </div>
-      )}
+    <div style={{
+      position: "relative",
+    }}>
+      <div style={{
+        position: "relative",
+        borderRadius: "12px",
+        overflow: "hidden",
+        boxShadow: "0 4px 8px rgba(0, 0, 0, 0.1)",
+        border: "2px solid var(--border)",
+      }}>
+        <Webcam
+          ref={webcamRef}
+          screenshotFormat="image/jpeg"
+          width={480}
+          height={360}
+          videoConstraints={{
+            facingMode: "user",
+            width: 1280,
+            height: 720
+          }}
+          style={{
+            width: "100%",
+            height: "auto",
+            display: "block",
+          }}
+        />
+        {isInitializing && (
+          <div style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(0, 0, 0, 0.75)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "white",
+            backdropFilter: "blur(4px)",
+          }}>
+            <div style={{
+              backgroundColor: "rgba(255, 255, 255, 0.1)",
+              padding: "1.5rem",
+              borderRadius: "12px",
+              textAlign: "center",
+              border: "2px solid rgba(255, 255, 255, 0.2)",
+            }}>
+              <div style={{
+                fontSize: "3rem",
+                fontWeight: "700",
+                marginBottom: "0.75rem",
+                color: "#10b981",
+              }}>
+                {countdown}
+              </div>
+              <p style={{
+                fontSize: "1.1rem",
+                marginBottom: "0.5rem",
+                fontWeight: "500",
+              }}>
+                Get Ready!
+              </p>
+              <p style={{
+                fontSize: "0.9rem",
+                opacity: 0.9,
+                maxWidth: "280px",
+              }}>
+                Sit upright and center yourself in the camera
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

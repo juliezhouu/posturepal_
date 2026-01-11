@@ -1,10 +1,10 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import WebcamFeed from "./components/WebcamFeed";
-import StatusDisplay from "./components/StatusDisplay";
+import WebcamFeed from "../components/WebcamFeed";
+import StatusDisplay from "../components/StatusDisplay";
 import "./globals.css"; // Import the global CSS
-import { checkPosture } from "./lib/api";
+import { checkPosture } from "../lib/api";
 
 export default function Home() {
   const [messages, setMessages] = useState(null);
@@ -82,29 +82,61 @@ export default function Home() {
 
   return (
     <div style={{
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      padding: "20px",
-      width: "90%",
-      // maxWidth: "1000px",
-      margin: "50px auto", // Centers the div horizontally and sets top margin
-      backgroundColor: "#ffffff",
-      borderRadius: "12px",
-      boxShadow: "0 4px 12px rgba(0, 0, 0, 0.1)",
+      maxWidth: "900px",
+      margin: "0 auto",
     }}>
-      <h1>Posture Pal</h1>
-      <WebcamFeed onCapture={handleCapture} />
+      {/* Header */}
+      <header style={{
+        textAlign: "center",
+        marginBottom: "1.5rem",
+      }}>
+        <h1 style={{
+          fontSize: "2rem",
+          fontWeight: "700",
+          color: "#1e293b",
+          marginBottom: "0.25rem",
+          textShadow: "0 1px 2px rgba(0,0,0,0.05)",
+        }}>PosturePal</h1>
+        <p style={{
+          fontSize: "0.95rem",
+          color: "#64748b",
+          fontWeight: "400",
+        }}>Your AI-Powered Posture Assistant</p>
+      </header>
 
-      <StatusDisplay 
-        posture={posture} 
-        message={message}
-        calibrating={calibrating}
-        secondsLeft={secondsLeft}
-        samplesCollected={samplesCollected}
-      />
+      {/* Main Content Card */}
+      <div style={{
+        backgroundColor: "var(--bg-primary)",
+        borderRadius: "16px",
+        boxShadow: "var(--shadow-lg)",
+        padding: "1.75rem",
+        backdropFilter: "blur(10px)",
+      }}>
+        <div style={{
+          display: "grid",
+          gap: "1.5rem",
+          gridTemplateColumns: "1fr",
+        }}>
+          <WebcamFeed onCapture={handleCapture} />
+          <StatusDisplay 
+            posture={posture} 
+            message={message}
+            calibrating={calibrating}
+            secondsLeft={secondsLeft}
+            samplesCollected={samplesCollected}
+          />
+        </div>
+      </div>
 
-
+      {/* Footer */}
+      <footer style={{
+        textAlign: "center",
+        marginTop: "1.5rem",
+        color: "#64748b",
+        fontSize: "0.85rem",
+      }}>
+        <p>Monitoring your posture for better health and productivity</p>
+      </footer>
     </div>
   );
 }
